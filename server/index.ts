@@ -17,13 +17,15 @@ const __dirname = path.dirname(__filename);
 dotenvConfig({ path: path.join(__dirname, "..", ".env") });
 
 const app = express();
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
 
 // ==================== 火山引擎 Ark API 配置 ====================
 
 const ARK_API_KEY = process.env.ARK_API_KEY || "";
 const ARK_BASE_URL = process.env.ARK_BASE_URL || "https://ark.cn-beijing.volces.com/api/coding/v3";
-const ARK_MODEL = process.env.ARK_MODEL || "Doubao-pro-32k";
+const ARK_MODEL = process.env.ARK_MODEL || "DeepSeek-V4-Pro";
 
 // ==================== Ark API 调用函数 ====================
 
@@ -196,8 +198,8 @@ app.get("/api/models", async (req, res) => {
   res.json({
     models: [
       { modelId: ARK_MODEL, name: ARK_MODEL },
-      { modelId: "Doubao-pro-32k", name: "Doubao Pro 32k" },
-      { modelId: "Doubao-lite-32k", name: "Doubao Lite 32k" },
+      { modelId: "DeepSeek-V4-Pro", name: "DeepSeek V4 Pro" },
+      { modelId: "DeepSeek-V3", name: "DeepSeek V3" },
     ],
     defaultModel: ARK_MODEL,
   });
