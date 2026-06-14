@@ -17,6 +17,20 @@ const __dirname = path.dirname(__filename);
 dotenvConfig({ path: path.join(__dirname, "..", ".env") });
 
 const app = express();
+
+// ==================== CORS 中间件 ====================
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", req.headers.origin || "*");
+  res.header("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  res.header("Access-Control-Allow-Credentials", "true");
+  if (req.method === "OPTIONS") {
+    res.status(204).end();
+    return;
+  }
+  next();
+});
+
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 const PORT = process.env.PORT || 3000;
@@ -29,119 +43,126 @@ const ARK_MODEL = process.env.ARK_MODEL || "DeepSeek-V4-Pro";
 
 // ==================== Ark API 调用函数 ====================
 
+interface ApiMessage {
+  role: string;
+  content: string;
+}
+
+interface StreamCallback {
+  (text: string): void;
+}
+
 /**
- * 调用火山引擎 Ark API（支持流式输出）
- * @param messages 对话消息列表
- * @param systemPrompt 系统提示词
- * @param onChunk 流式输出回调（可选，不传则等待完整响应）
- * @returns 完整回复文本
+ * 调用火山引擎 Ark API（SSE 流式）
  */
 async function callArkAPI(
-  messages: Array<{ role: string; content: string }>,
+  messages: ApiMessage[],
   systemPrompt: string,
-  onChunk?: (text: string) => void
+  onChunk: StreamCallback
 ): Promise<string> {
-  const url = `${ARK_BASE_URL}/chat/completions`;
 
-  const body: any = {
+  const payload = {
     model: ARK_MODEL,
     messages: [
       { role: "system", content: systemPrompt },
-      ...messages
+      ...messages,
     ],
-    stream: !!onChunk,
-    max_tokens: 2000,
+    stream: true,
     temperature: 0.7,
+    max_tokens: 8000,
   };
 
-  const response = await fetch(url, {
+  const response = await fetch(`${ARK_BASE_URL}/chat/completions`, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${ARK_API_KEY}`,
       "Content-Type": "application/json",
+      "Authorization": `Bearer ${ARK_API_KEY}`,
     },
-    body: JSON.stringify(body),
+    body: JSON.stringify(payload),
   });
 
   if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Ark API 错误 ${response.status}: ${errorText}`);
+    const errText = await response.text();
+    throw new Error(`Ark API 错误 ${response.status}: ${errText}`);
   }
 
-  if (onChunk) {
-    // 流式处理 SSE
-    const reader = response.body?.getReader();
-    if (!reader) throw new Error("响应无正文");
+  const reader = response.body?.getReader();
+  if (!reader) throw new Error("无响应流");
 
-    const decoder = new TextDecoder();
-    let fullText = "";
-    let buffer = "";
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let fullContent = "";
 
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
 
-      buffer += decoder.decode(value, { stream: true });
-      const lines = buffer.split("\n");
-      // 保留最后一个可能不完整的行
-      buffer = lines.pop() || "";
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() || "";
 
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed.startsWith("data: ")) continue;
-        const data = trimmed.slice(6).trim();
-        if (data === "[DONE]") break;
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith("data:")) continue;
+      const dataStr = trimmed.slice(5).trim();
+      if (dataStr === "[DONE]") break;
 
-        try {
-          const json = JSON.parse(data);
-          const text = json.choices?.[0]?.delta?.content;
-          if (text) {
-            fullText += text;
-            onChunk(text);
-          }
-        } catch (e) {
-          // 忽略解析错误（可能是不完整的 JSON）
+      try {
+        const json = JSON.parse(dataStr);
+        const content = json.choices?.[0]?.delta?.content;
+        if (content) {
+          fullContent += content;
+          onChunk(content);
         }
+      } catch {
+        // ignore parse errors
       }
     }
-
-    // 处理缓冲区剩余内容
-    if (buffer.trim().startsWith("data: ")) {
-      const data = buffer.trim().slice(6).trim();
-      if (data && data !== "[DONE]") {
-        try {
-          const json = JSON.parse(data);
-          const text = json.choices?.[0]?.delta?.content;
-          if (text) {
-            fullText += text;
-            onChunk(text);
-          }
-        } catch (e) {
-          // 忽略
-        }
-      }
-    }
-
-    return fullText;
-  } else {
-    // 非流式，直接返回完整响应
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content || "";
   }
+
+  return fullContent;
 }
 
-// ==================== 健康检查 ====================
+// ==================== 哲学家历史构建 ====================
 
+/**
+ * 构建完整对话历史（包含所有哲学家回复，用于跨哲学家上下文）
+ */
+function buildFullHistory(sessionId: string): Array<{ role: string; content: string }> {
+  const msgs = db.getMessagesBySession(sessionId);
+  const history: Array<{ role: string; content: string }> = [];
+
+  for (const msg of msgs) {
+    if (msg.role === "user") {
+      let displayContent = msg.content;
+      if (msg.mentions) {
+        try {
+          const ments = JSON.parse(msg.mentions);
+          if (ments && ments.length > 0) {
+            const names = ments.map((mid: string) => PHILOSOPHERS[mid]?.name || mid).join("、");
+            displayContent = `[用户向 ${names} 提问] ${displayContent}`;
+          }
+        } catch {}
+      }
+      history.push({ role: "user", content: displayContent });
+    } else if (msg.role === "assistant" && msg.philosopher_id) {
+      const p = PHILOSOPHERS[msg.philosopher_id];
+      const name = p ? `${p.emoji} ${p.name}` : msg.philosopher_id;
+      history.push({ role: "assistant", content: `${name}：${msg.content}` });
+    }
+  }
+
+  return history;
+}
+
+// ==================== 路由 ====================
+
+// 健康检查
 app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    timestamp: new Date().toISOString(),
-    ark_configured: !!ARK_API_KEY,
-  });
+  res.json({ status: "ok", model: ARK_MODEL });
 });
 
-// ==================== 哲学家配置 API ====================
-
+// 获取哲学家列表
 app.get("/api/philosophers", (req, res) => {
   const philosophers = Object.values(PHILOSOPHERS).map(p => ({
     id: p.id,
@@ -157,8 +178,7 @@ app.get("/api/philosophers", (req, res) => {
   res.json({ philosophers });
 });
 
-// ==================== 登录/配置检查 ====================
-
+// 登录/配置检查
 app.get("/api/check-login", async (req, res) => {
   const configured = !!ARK_API_KEY;
   res.json({
@@ -171,30 +191,17 @@ app.get("/api/check-login", async (req, res) => {
   });
 });
 
-// 保存环境变量配置（运行时动态设置）
+// 保存环境变量配置
 app.post("/api/save-env-config", (req, res) => {
   const { apiKey, baseUrl, model } = req.body;
-
-  if (apiKey) {
-    process.env.ARK_API_KEY = apiKey;
-  }
-  if (baseUrl) {
-    process.env.ARK_BASE_URL = baseUrl;
-  }
-  if (model) {
-    process.env.ARK_MODEL = model;
-  }
-
-  res.json({
-    success: true,
-    message: "已更新配置（重启服务器后失效，请同步修改 .env 文件）",
-  });
+  if (apiKey) process.env.ARK_API_KEY = apiKey;
+  if (baseUrl) process.env.ARK_BASE_URL = baseUrl;
+  if (model) process.env.ARK_MODEL = model;
+  res.json({ success: true, message: "已更新配置（重启服务器后失效，请同步修改 .env 文件）" });
 });
 
-// ==================== 模型 API ====================
-
+// 模型列表
 app.get("/api/models", async (req, res) => {
-  // 返回配置的模型列表
   res.json({
     models: [
       { modelId: ARK_MODEL, name: ARK_MODEL },
@@ -205,53 +212,42 @@ app.get("/api/models", async (req, res) => {
   });
 });
 
-// ==================== 会话 API ====================
-
+// 会话列表
 app.get("/api/sessions", (req, res) => {
   try {
     const sessions = db.getAllSessions();
     const sessionsWithMessages = sessions.map((session: any) => {
       const messages = db.getMessagesBySession(session.id);
-      return {
-        ...session,
-        messageCount: messages.length,
-      };
+      return { ...session, messageCount: messages.length };
     });
     res.json({ sessions: sessionsWithMessages });
   } catch (error: any) {
-    console.error("[Sessions] Error:", error);
     res.status(500).json({ error: error?.message || "获取会话失败" });
   }
 });
 
+// 获取单个会话
 app.get("/api/sessions/:sessionId", (req, res) => {
   try {
     const { sessionId } = req.params;
     const session = db.getSession(sessionId);
-
-    if (!session) {
-      return res.status(404).json({ error: "会话不存在" });
-    }
-
+    if (!session) return res.status(404).json({ error: "会话不存在" });
     const messages = db.getMessagesBySession(sessionId);
-
     const parsedMessages = messages.map((msg: any) => ({
       ...msg,
       tool_calls: msg.tool_calls ? JSON.parse(msg.tool_calls) : null,
     }));
-
     res.json({ session, messages: parsedMessages });
   } catch (error: any) {
-    console.error("[Session] Error:", error);
     res.status(500).json({ error: error?.message || "获取会话失败" });
   }
 });
 
+// 创建会话
 app.post("/api/sessions", (req, res) => {
   try {
     const { model = ARK_MODEL, title = "哲学讨论" } = req.body;
     const now = new Date().toISOString();
-
     const session = db.createSession({
       id: uuidv4(),
       title,
@@ -259,137 +255,74 @@ app.post("/api/sessions", (req, res) => {
       created_at: now,
       updated_at: now,
     });
-
     res.json({ session });
   } catch (error: any) {
-    console.error("[Create Session] Error:", error);
     res.status(500).json({ error: error?.message || "创建会话失败" });
   }
 });
 
+// 更新会话
 app.patch("/api/sessions/:sessionId", (req, res) => {
   try {
     const { sessionId } = req.params;
     const { title, model } = req.body;
-
     const success = db.updateSession(sessionId, { title, model });
-
-    if (!success) {
-      return res.status(404).json({ error: "会话不存在" });
-    }
-
+    if (!success) return res.status(404).json({ error: "会话不存在" });
     res.json({ success: true });
   } catch (error: any) {
-    console.error("[Update Session] Error:", error);
     res.status(500).json({ error: error?.message || "更新会话失败" });
   }
 });
 
+// 删除会话
 app.delete("/api/sessions/:sessionId", (req, res) => {
   try {
     const { sessionId } = req.params;
     const success = db.deleteSession(sessionId);
-
-    if (!success) {
-      return res.status(404).json({ error: "会话不存在" });
-    }
-
+    if (!success) return res.status(404).json({ error: "会话不存在" });
     res.json({ success: true });
   } catch (error: any) {
-    console.error("[Delete Session] Error:", error);
     res.status(500).json({ error: error?.message || "删除会话失败" });
   }
 });
 
-// ==================== 哲学讨论 API（核心功能） ====================
+// ==================== 导出对话 API ====================
 
-/**
- * 哲学大讨论 - 统筹Agent调度四位哲学家
- * 支持两种模式：
- * 1. 统筹模式（mode=moderated）：由总Agent统筹，逐一向各哲学家提问
- * 2. 单哲学家模式（mode=single）：直接与某位哲学家对话
- */
-app.post("/api/philosophy/discuss", async (req, res) => {
-  const {
-    sessionId,
-    question,
-    model,
-    mode = "moderated",
-    philosopherId,
-  } = req.body;
-
-  console.log(`\n[Philosophy] ========== 新哲学讨论 ==========`);
-  console.log(`[Philosophy] Mode: ${mode}`);
-  console.log(`[Philosophy] Question: ${question?.slice(0, 100)}`);
-
-  if (!question) {
-    return res.status(400).json({ error: "请输入哲学问题" });
-  }
-
-  if (!ARK_API_KEY) {
-    return res.status(500).json({ error: "未配置 ARK_API_KEY，请在 .env 文件中填写火山引擎 Ark API Key" });
-  }
-
-  // 获取或创建会话
-  let session = sessionId ? db.getSession(sessionId) : null;
-  const now = new Date().toISOString();
-
-  if (!session) {
-    session = db.createSession({
-      id: sessionId || uuidv4(),
-      title: question.slice(0, 30) + (question.length > 30 ? "..." : ""),
-      model: model || ARK_MODEL,
-      created_at: now,
-      updated_at: now,
-    });
-  }
-
-  const selectedModel = model || session.model || ARK_MODEL;
-  const userMessageId = uuidv4();
-  const assistantMessageId = uuidv4();
-
-  // 保存用户消息
-  db.createMessage({
-    id: userMessageId,
-    session_id: session.id,
-    role: "user",
-    content: question,
-    model: null,
-    created_at: now,
-    tool_calls: null,
-  });
-
-  // 设置 SSE 头
-  res.setHeader("Content-Type", "text/event-stream");
-  res.setHeader("Cache-Control", "no-cache");
-  res.setHeader("Connection", "keep-alive");
-
-  // 发送初始化事件
-  res.write(`data: ${JSON.stringify({
-    type: "init",
-    sessionId: session.id,
-    userMessageId,
-    assistantMessageId,
-    model: selectedModel,
-    mode,
-  })}\n\n`);
-
+app.get("/api/philosophy/export/:sessionId", (req, res) => {
   try {
-    if (mode === "single" && philosopherId) {
-      // 单哲学家对话模式
-      await handleSinglePhilosopher(res, question, philosopherId, selectedModel, session, assistantMessageId);
-    } else {
-      // 统筹模式：依次让四位哲学家发言
-      await handleModeratedDiscussion(res, question, selectedModel, session, assistantMessageId);
+    const { sessionId } = req.params;
+    const session = db.getSession(sessionId);
+    if (!session) return res.status(404).json({ error: "会话不存在" });
+
+    const messages = db.getMessagesBySession(sessionId);
+    if (messages.length === 0) return res.status(404).json({ error: "会话没有消息" });
+
+    let md = `# ${session.title || "哲学对话"}\n\n`;
+    md += `> 导出时间：${new Date().toLocaleString("zh-CN")}\n\n`;
+    md += `---\n\n`;
+
+    for (const msg of messages) {
+      if (msg.role === "user") {
+        md += `## 👤 用户\n\n${msg.content}\n\n`;
+      } else if (msg.role === "assistant" && msg.philosopher_id) {
+        const p = PHILOSOPHERS[msg.philosopher_id];
+        const name = p ? `${p.emoji} ${p.name}` : msg.philosopher_id;
+        md += `## ${name}\n\n${msg.content}\n\n`;
+      }
     }
+
+    md += `---\n\n*由哲学家多Agent讨论系统导出*\n`;
+
+    res.setHeader("Content-Type", "text/markdown; charset=utf-8");
+    res.setHeader("Content-Disposition", `attachment; filename="philosophy-${sessionId.slice(0, 8)}.md"`);
+    res.send(md);
   } catch (error: any) {
-    console.error(`[Philosophy] Error:`, error);
-    res.write(`data: ${JSON.stringify({ type: "error", message: error?.message || "哲学讨论出错" })}\n\n`);
-    res.end();
+    console.error("[Export] Error:", error);
+    res.status(500).json({ error: error?.message || "导出失败" });
   }
 });
 
-// ==================== 哲学家 @mention 聊天 API ====================
+// ==================== 哲学讨论 API（核心功能） ====================
 
 /**
  * 解析消息中的 @mention，返回被提及的哲学家 ID 列表
@@ -416,46 +349,18 @@ function parseMentions(message: string): string[] {
 }
 
 /**
- * 为指定哲学家构建对话历史（用于多轮对话上下文）
- */
-function buildPhilosopherHistory(sessionId: string, philosopherId: string): Array<{ role: string; content: string }> {
-  const msgs = db.getPhilosopherMessages(sessionId, philosopherId);
-  const history: Array<{ role: string; content: string }> = [];
-
-  for (const msg of msgs) {
-    if (msg.role === 'user') {
-      // 用户消息：如果有mentions，展示提及了谁
-      let content = msg.content;
-      if (msg.mentions) {
-        try {
-          const ments = JSON.parse(msg.mentions);
-          if (ments && ments.length > 0) {
-            const names = ments.map((mid: string) => PHILOSOPHERS[mid]?.name || mid).join('、');
-            content = `[用户向 ${names} 提问] ${content}`;
-          }
-        } catch {}
-      }
-      history.push({ role: 'user', content });
-    } else if (msg.role === 'assistant' && msg.philosopher_id === philosopherId) {
-      history.push({ role: 'assistant', content: msg.content });
-    }
-  }
-
-  return history;
-}
-
-/**
  * 哲学家 @mention 聊天模式
- * 用户发送消息，@ 提及某些哲学家，被提及的哲学家依次回应
- * 支持多轮对话，保留上下文
+ * 用户发送消息，指定哪些哲学家回复（通过 selectedPhilosopherIds 或 @mention 解析）
+ * 支持多轮对话，保留上下文（包括其他哲学家的回复）
  */
 app.post("/api/philosophy/chat", async (req, res) => {
-  const { sessionId, message, mode = "chat", mentions: reqMentions } = req.body;
+  const { sessionId, message, selectedPhilosopherIds, replyToMessageId } = req.body;
 
   console.log(`\n[Philosophy/Chat] ========== 新消息 ==========`);
   console.log(`[Philosophy/Chat] Message: ${message?.slice(0, 80)}`);
+  if (replyToMessageId) console.log(`[Philosophy/Chat] ReplyTo: ${replyToMessageId}`);
 
-  if (!message) {
+  if (!message && !replyToMessageId) {
     return res.status(400).json({ error: "请输入消息内容" });
   }
 
@@ -463,16 +368,16 @@ app.post("/api/philosophy/chat", async (req, res) => {
     return res.status(500).json({ error: "未配置 ARK_API_KEY" });
   }
 
-  // 解析 @mentions
-  const mentions = reqMentions && Array.isArray(reqMentions) && reqMentions.length > 0
-    ? reqMentions
+  // 确定要回复的哲学家列表：优先使用 selectedPhilosopherIds，否则解析 @mentions
+  const mentions = (selectedPhilosopherIds && Array.isArray(selectedPhilosopherIds) && selectedPhilosopherIds.length > 0)
+    ? selectedPhilosopherIds
     : parseMentions(message);
 
   if (mentions.length === 0) {
-    return res.status(400).json({ error: "请 @ 提及至少一位哲学家，例如：@亚里士多德 你认为什么是幸福？" });
+    return res.status(400).json({ error: "请选择至少一位哲学家进行对话" });
   }
 
-  console.log(`[Philosophy/Chat] Mentions: ${mentions.join(', ')}`);
+  console.log(`[Philosophy/Chat] Philosophers: ${mentions.join(", ")}`);
 
   // 获取或创建会话
   let session = sessionId ? db.getSession(sessionId) : null;
@@ -490,7 +395,7 @@ app.post("/api/philosophy/chat", async (req, res) => {
 
   const userMessageId = uuidv4();
 
-  // 保存用户消息（含 mentions）
+  // 保存用户消息
   db.createMessage({
     id: userMessageId,
     session_id: session.id,
@@ -519,6 +424,21 @@ app.post("/api/philosophy/chat", async (req, res) => {
   })}\n\n`);
 
   try {
+    // 构建基础历史（包含所有哲学家回复）
+    const baseHistory = buildFullHistory(session.id);
+
+    // 如果是指定回复某条消息，把那条消息内容加入上下文
+    let replyContext = "";
+    if (replyToMessageId) {
+      const replyMsg = db.getMessage(replyToMessageId);
+      if (replyMsg) {
+        const p = replyMsg.philosopher_id ? PHILOSOPHERS[replyMsg.philosopher_id] : null;
+        replyContext = p
+          ? `\n[用户正在回复 ${p.emoji}${p.name}的这段话：\n"${replyMsg.content.slice(0, 500)}"]\n`
+          : `\n[用户正在回复这段话：\n"${replyMsg.content.slice(0, 500)}"]\n`;
+      }
+    }
+
     // 依次让被提及的哲学家回复
     for (const philosopherId of mentions) {
       const philosopher = PHILOSOPHERS[philosopherId];
@@ -526,7 +446,8 @@ app.post("/api/philosophy/chat", async (req, res) => {
 
       const philosopherMsgId = uuidv4();
 
-      // 通知前端该哲学家开始回复
+      try {
+        // 通知前端该哲学家开始回复
       res.write(`data: ${JSON.stringify({
         type: "philosopher_start",
         philosopherId,
@@ -536,19 +457,14 @@ app.post("/api/philosophy/chat", async (req, res) => {
         messageId: philosopherMsgId,
       })}\n\n`);
 
-      try {
-        // 构建对话历史
-        const history = buildPhilosopherHistory(session.id, philosopherId);
-
-        // 构建当前用户消息（去掉 @mention 标记，让哲学家专注内容）
-        const cleanMessage = message
-          .replace(/@(亚里士多德|孔子|黑格尔|庄子|aristotle|confucius|hegel|zhuangzi)/gi, '')
-          .replace(/🏛️|📜|⚡|🦋/g, '')
-          .trim();
+        // 构建当前用户消息（包含回复上下文）
+        const userContent = replyContext
+          ? (message ? `${replyContext}\n用户的追问：${message}` : replyContext)
+          : message;
 
         const messagesForApi = [
-          ...history,
-          { role: "user", content: cleanMessage || message },
+          ...baseHistory,
+          { role: "user", content: userContent },
         ];
 
         let philosopherResponse = "";
@@ -567,7 +483,7 @@ app.post("/api/philosophy/chat", async (req, res) => {
           }
         );
 
-        // 哲学家回复完毕，保存消息
+        // 保存哲学家回复
         db.createMessage({
           id: philosopherMsgId,
           session_id: session.id,
@@ -609,217 +525,16 @@ app.post("/api/philosophy/chat", async (req, res) => {
   }
 });
 
-/**
- * 统筹模式：主持人先发言，然后依次调用每位哲学家
- */
-async function handleModeratedDiscussion(
-  res: express.Response,
-  question: string,
-  model: string,
-  session: any,
-  assistantMessageId: string
-) {
-  const philosopherOrder = ["aristotle", "confucius", "hegel", "zhuangzi"];
-  let fullResponse = "";
+// ==================== 统筹讨论模式（保留原功能） ====================
 
-  // 第一步：主持人开场
-  res.write(`data: ${JSON.stringify({
-    type: "moderator_start",
-    content: "正在召集四位哲学大师进行讨论...",
-  })}\n\n`);
+app.post("/api/philosophy/discuss", async (req, res) => {
+  const { sessionId, question, mode = "moderated" } = req.body;
 
-  // 依次获取每位哲学家的观点
-  for (const philosopherId of philosopherOrder) {
-    const philosopher = PHILOSOPHERS[philosopherId];
-    if (!philosopher) continue;
+  console.log(`\n[Philosophy/Discuss] ========== 新问题 ==========`);
+  console.log(`[Philosophy/Discuss] Question: ${question?.slice(0, 80)}`);
 
-    console.log(`[Philosophy] 召唤 ${philosopher.name}...`);
-
-    // 通知前端当前哲学家开始发言
-    res.write(`data: ${JSON.stringify({
-      type: "philosopher_start",
-      philosopherId,
-      philosopherName: philosopher.name,
-      philosopherEmoji: philosopher.emoji,
-      philosopherColor: philosopher.color,
-    })}\n\n`);
-
-    try {
-      // 为每位哲学家构建提问
-      const philosopherPrompt = `关于以下哲学问题，请从你的哲学体系出发给出你的思考与见解：
-
-问题：${question}
-
-请以你自己的身份和哲学思想体系回答，引用你的核心概念和著作，展现你独特的哲学视角。回答请在300字以内，精炼深刻。`;
-
-      let philosopherResponse = "";
-
-      await callArkAPI(
-        [{ role: "user", content: philosopherPrompt }],
-        philosopher.systemPrompt,
-        (textChunk) => {
-          philosopherResponse += textChunk;
-          res.write(`data: ${JSON.stringify({
-            type: "philosopher_text",
-            philosopherId,
-            content: textChunk,
-          })}\n\n`);
-        }
-      );
-
-      // 哲学家发言完毕
-      res.write(`data: ${JSON.stringify({
-        type: "philosopher_done",
-        philosopherId,
-        philosopherName: philosopher.name,
-      })}\n\n`);
-
-      fullResponse += `\n\n【${philosopher.emoji} ${philosopher.name}】\n${philosopherResponse}`;
-
-      console.log(`[Philosophy] ${philosopher.name} 发言完毕 (${philosopherResponse.length} 字)`);
-
-    } catch (err: any) {
-      console.error(`[Philosophy] ${philosopher.name} 发言出错:`, err);
-      res.write(`data: ${JSON.stringify({
-        type: "philosopher_error",
-        philosopherId,
-        error: err?.message || "发言出错",
-      })}\n\n`);
-    }
-  }
-
-  // 最后：主持人总结
-  res.write(`data: ${JSON.stringify({
-    type: "moderator_summary_start",
-    content: "正在生成哲学综合总结...",
-  })}\n\n`);
-
-  try {
-    const summaryPrompt = `以下是四位哲学家对"${question}"这一问题的回答：
-
-${fullResponse}
-
-请作为一位中立的哲学讨论主持人，用150字左右综合这四位哲学家的智慧，指出其中的共鸣之处与分歧所在，给出对这个问题的多维度哲学启示。`;
-
-    let summaryResponse = "";
-
-    await callArkAPI(
-      [{ role: "user", content: summaryPrompt }],
-      MODERATOR_SYSTEM_PROMPT,
-      (textChunk) => {
-        summaryResponse += textChunk;
-        res.write(`data: ${JSON.stringify({
-          type: "moderator_text",
-          content: textChunk,
-        })}\n\n`);
-      }
-    );
-
-    fullResponse += `\n\n【主持人总结】\n${summaryResponse}`;
-
-  } catch (err: any) {
-    console.error(`[Philosophy] 总结出错:`, err);
-  }
-
-  // 保存完整对话到数据库
-  db.createMessage({
-    id: assistantMessageId,
-    session_id: session.id,
-    role: "assistant",
-    content: fullResponse,
-    model: model,
-    created_at: new Date().toISOString(),
-    tool_calls: null,
-  });
-
-  res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
-  res.end();
-}
-
-/**
- * 单哲学家对话模式
- */
-async function handleSinglePhilosopher(
-  res: express.Response,
-  question: string,
-  philosopherId: string,
-  model: string,
-  session: any,
-  assistantMessageId: string
-) {
-  const philosopher = PHILOSOPHERS[philosopherId];
-  if (!philosopher) {
-    res.write(`data: ${JSON.stringify({ type: "error", message: `未找到哲学家: ${philosopherId}` })}\n\n`);
-    res.end();
-    return;
-  }
-
-  res.write(`data: ${JSON.stringify({
-    type: "philosopher_start",
-    philosopherId,
-    philosopherName: philosopher.name,
-    philosopherEmoji: philosopher.emoji,
-    philosopherColor: philosopher.color,
-  })}\n\n`);
-
-  let fullResponse = "";
-
-  try {
-    await callArkAPI(
-      [{ role: "user", content: question }],
-      philosopher.systemPrompt,
-      (textChunk) => {
-        fullResponse += textChunk;
-        res.write(`data: ${JSON.stringify({
-          type: "philosopher_text",
-          philosopherId,
-          content: textChunk,
-        })}\n\n`);
-      }
-    );
-
-    res.write(`data: ${JSON.stringify({
-      type: "philosopher_done",
-      philosopherId,
-      philosopherName: philosopher.name,
-    })}\n\n`);
-
-    // 保存到数据库
-    db.createMessage({
-      id: assistantMessageId,
-      session_id: session.id,
-      role: "assistant",
-      content: `【${philosopher.emoji} ${philosopher.name}】\n${fullResponse}`,
-      model: model,
-      created_at: new Date().toISOString(),
-      tool_calls: null,
-    });
-
-    res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
-    res.end();
-
-  } catch (err: any) {
-    console.error(`[Philosophy] ${philosopher.name} 对话出错:`, err);
-    res.write(`data: ${JSON.stringify({
-      type: "error",
-      message: err?.message || "对话出错",
-    })}\n\n`);
-    res.end();
-  }
-}
-
-// ==================== 普通聊天 API（保持原有功能，改用 Ark API） ====================
-
-app.post("/api/chat", async (req, res) => {
-  const { sessionId, message, model, systemPrompt } = req.body;
-
-  console.log(`\n[Chat] ========== 新请求 ==========`);
-  console.log(`[Chat] SessionId: ${sessionId}`);
-  console.log(`[Chat] Model: ${model}`);
-  console.log(`[Chat] Message: ${message?.slice(0, 100)}${message?.length > 100 ? "..." : ""}`);
-
-  if (!message) {
-    return res.status(400).json({ error: "消息不能为空" });
+  if (!question) {
+    return res.status(400).json({ error: "请输入讨论问题" });
   }
 
   if (!ARK_API_KEY) {
@@ -832,74 +547,119 @@ app.post("/api/chat", async (req, res) => {
   if (!session) {
     session = db.createSession({
       id: sessionId || uuidv4(),
-      title: message.slice(0, 30) + (message.length > 30 ? "..." : ""),
-      model: model || ARK_MODEL,
+      title: question.slice(0, 30) + (question.length > 30 ? "..." : ""),
+      model: ARK_MODEL,
       created_at: now,
       updated_at: now,
     });
   }
 
-  const selectedModel = model || session.model || ARK_MODEL;
   const userMessageId = uuidv4();
-  const assistantMessageId = uuidv4();
-
-  try {
-    db.createMessage({
-      id: userMessageId,
-      session_id: session.id,
-      role: "user",
-      content: message,
-      model: null,
-      created_at: now,
-      tool_calls: null,
-    });
-  } catch (dbError: any) {
-    return res.status(500).json({ error: "保存消息失败", detail: dbError?.message });
-  }
+  db.createMessage({
+    id: userMessageId,
+    session_id: session.id,
+    role: "user",
+    content: question,
+    model: null,
+    created_at: now,
+    tool_calls: null,
+    philosopher_id: null,
+    mentions: JSON.stringify(["aristotle", "confucius", "hegel", "zhuangzi"]),
+  });
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
   res.setHeader("Connection", "keep-alive");
-
-  const effectiveSystemPrompt = systemPrompt || "你是一个专业的AI助手，善于帮助用户解决各种问题。请用简洁清晰的方式回答问题。";
+  res.setHeader("X-Accel-Buffering", "no");
 
   res.write(`data: ${JSON.stringify({
     type: "init",
     sessionId: session.id,
     userMessageId,
-    assistantMessageId,
-    model: selectedModel,
+    mode: "moderated",
   })}\n\n`);
 
   try {
-    let fullResponse = "";
+    // 1. 主持人开场
+    const moderatorHistory = buildFullHistory(session.id);
+    const moderatorPrompt = MODERATOR_SYSTEM_PROMPT.replace("{QUESTION}", question);
 
+    let moderatorSummary = "";
     await callArkAPI(
-      [{ role: "user", content: message }],
-      effectiveSystemPrompt,
-      (textChunk) => {
-        fullResponse += textChunk;
-        res.write(`data: ${JSON.stringify({ type: "text", content: textChunk })}\n\n`);
-      }
+      [...moderatorHistory, { role: "user", content: `请作为主持人，针对问题"${question}"做开场引导。` }],
+      moderatorPrompt,
+      (chunk) => { moderatorSummary += chunk; }
     );
 
-    db.createMessage({
-      id: assistantMessageId,
-      session_id: session.id,
-      role: "assistant",
-      content: fullResponse,
-      model: selectedModel,
-      created_at: new Date().toISOString(),
-      tool_calls: null,
-    });
+    // 2. 四位哲学家依次发言
+    const allPhilosopherIds = ["aristotle", "confucius", "hegel", "zhuangzi"];
+    for (const pid of allPhilosopherIds) {
+      const p = PHILOSOPHERS[pid];
+      const msgId = uuidv4();
+
+      res.write(`data: ${JSON.stringify({
+        type: "philosopher_start",
+        philosopherId: pid,
+        philosopherName: p.name,
+        philosopherEmoji: p.emoji,
+        philosopherColor: p.color,
+        messageId: msgId,
+      })}\n\n`);
+
+      try {
+        const history = buildFullHistory(session.id);
+        let response = "";
+        await callArkAPI(
+          [...history, { role: "user", content: `问题："${question}"。请作为${p.name}回答。` }],
+          p.systemPrompt,
+          (chunk) => {
+            response += chunk;
+            res.write(`data: ${JSON.stringify({
+              type: "philosopher_text",
+              philosopherId: pid,
+              messageId: msgId,
+              content: chunk,
+            })}\n\n`);
+          }
+        );
+
+        db.createMessage({
+          id: msgId, session_id: session.id, role: "assistant",
+          content: response, model: ARK_MODEL,
+          created_at: new Date().toISOString(), tool_calls: null,
+          philosopher_id: pid, mentions: null,
+        });
+
+        res.write(`data: ${JSON.stringify({
+          type: "philosopher_done", philosopherId: pid,
+          philosopherName: p.name, messageId: msgId,
+        })}\n\n`);
+      } catch (err: any) {
+        res.write(`data: ${JSON.stringify({
+          type: "philosopher_error", philosopherId: pid,
+          error: err?.message || "出错",
+        })}\n\n`);
+      }
+    }
+
+    // 3. 主持人总结
+    const finalHistory = buildFullHistory(session.id);
+    let finalSummary = "";
+    await callArkAPI(
+      [...finalHistory, { role: "user", content: "请作为主持人，对以上讨论做总结。" }],
+      moderatorPrompt,
+      (chunk) => { finalSummary += chunk; }
+    );
+
+    res.write(`data: ${JSON.stringify({
+      type: "moderator_summary", summary: finalSummary,
+    })}\n\n`);
 
     res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
     res.end();
 
   } catch (error: any) {
-    console.error(`[Chat] Error:`, error);
-    const errorMessage = error?.message || "处理请求时发生错误";
-    res.write(`data: ${JSON.stringify({ type: "error", message: errorMessage })}\n\n`);
+    res.write(`data: ${JSON.stringify({ type: "error", message: error?.message || "讨论出错" })}\n\n`);
     res.end();
   }
 });
@@ -907,19 +667,18 @@ app.post("/api/chat", async (req, res) => {
 // ==================== 启动服务器 ====================
 
 app.listen(PORT, () => {
-  console.log(`
-╔════════════════════════════════════════════════════════╗
-║                                                        ║
-║   🏛️  哲学家多Agent讨论系统 已启动                      ║
-║                                                        ║
-║   地址: http://localhost:${PORT}                         ║
-║   数据库: SQLite (data/chat.db)                        ║
-║                                                        ║
-║   哲学家: 亚里士多德 | 孔子 | 黑格尔 | 庄子            ║
-║                                                        ║
-║   LLM: 火山引擎 Ark API                               ║
-║   模型: ${ARK_MODEL.padEnd(43)}║
-║                                                        ║
-╚════════════════════════════════════════════════════════╝
-  `);
+  console.log("\n╔════════════════════════════════════════════════════════╗");
+  console.log("║                                                        ║");
+  console.log("║   🏛️  哲学家多Agent讨论系统 已启动                      ║");
+  console.log("║                                                        ║");
+  console.log(`║   地址: http://localhost:${PORT}                         ║`);
+  console.log("║   数据库: SQLite (data/chat.db)                        ║");
+  console.log("║                                                        ║");
+  console.log("║   哲学家: 亚里士多德 | 孔子 | 黑格尔 | 庄子            ║");
+  console.log("║                                                        ║");
+  console.log("║   LLM: 火山引擎 Ark API                               ║");
+  console.log(`║   模型: ${ARK_MODEL.padEnd(20)} ║`);
+  console.log("║                                                        ║");
+  console.log("╚════════════════════════════════════════════════════════╝");
+  console.log();
 });

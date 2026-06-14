@@ -129,6 +129,11 @@ export function deleteSession(id: string) {
 
 // ============= 消息操作 =============
 
+export function getMessage(id: string) {
+  const stmt = db.prepare('SELECT * FROM messages WHERE id = ?');
+  return stmt.get(id);
+}
+
 export function getMessagesBySession(sessionId: string) {
   const stmt = db.prepare('SELECT * FROM messages WHERE session_id = ? ORDER BY created_at ASC');
   return stmt.all(sessionId);

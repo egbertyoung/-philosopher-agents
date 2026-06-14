@@ -5,9 +5,10 @@ import { PHILOSOPHERS } from '../config';
 interface ChatInputProps {
   onSend: (text: string) => void;
   isLoading: boolean;
+  placeholder?: string;
 }
 
-export function ChatInput({ onSend, isLoading }: ChatInputProps) {
+export function ChatInput({ onSend, isLoading, placeholder }: ChatInputProps) {
   const [text, setText] = useState('');
   const [showMentions, setShowMentions] = useState(false);
   const [mentionFilter, setMentionFilter] = useState('');
@@ -148,7 +149,7 @@ export function ChatInput({ onSend, isLoading }: ChatInputProps) {
             value={text}
             onChange={handleInput}
             onKeyDown={handleKeyDown}
-            placeholder="输入消息，用 @ 提及哲学家，例如：@亚里士多德 你认为什么是幸福？"
+            placeholder={placeholder || "输入消息，按 Enter 发送，Shift+Enter 换行"}
             disabled={isLoading}
             rows={1}
             className="w-full px-4 py-3 border border-gray-300 rounded-xl resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm max-h-32"

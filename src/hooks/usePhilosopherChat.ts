@@ -3,14 +3,22 @@ import { PhilosopherSpeech, PhilosophyMessage } from '../types';
 
 const API_BASE = import.meta.env.VITE_API_BASE || 'http://localhost:3000';
 
+export interface SendOptions {
+  selectedPhilosopherIds?: string[];
+  replyToMessageId?: string;
+}
+
 export function usePhilosopherChat() {
   const [messages, setMessages] = useState<PhilosophyMessage[]>([]);
   const [isLoading, setIsLoading] = useState(false);
   const [sessionId, setSessionId] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  const sendMessage = useCallback(async (text: string, mode: 'chat' | 'moderated' | 'single' = 'chat', philosopherId?: string) => {
-    if (!text.trim() || isLoading) return;
+  const sendMessage = useCallback(async (
+    text: string,
+    options: SendOptions = {}
+  ) => {
+    if ((!text.trim() && !options.replyToMessageId) || isLoading) return;
 
     setIsLoading(true);
     const userMsg: PhilosophyMessage = {
@@ -25,8 +33,13 @@ export function usePhilosopherChat() {
     setMessages(prev => [...prev, userMsg]);
 
     try {
-      const body: any = { message: text, mode, sessionId };
-      if (mode === 'single' && philosopherId) body.philosopherId = philosopherId;
+      const body: any = {
+        message: text,
+        mode: 'chat',
+        sessionId,
+        selectedPhilosopherIds: options.selectedPhilosopherIds || [],
+        replyToMessageId: options.replyToMessageId || undefined,
+      };
 
       const controller = new AbortController();
       abortRef.current = controller;
@@ -146,6 +159,14 @@ export function usePhilosopherChat() {
               }));
             }
 
+            if (data.type === 'moderator_summary') {
+              setMessages(prev => prev.map(m =>
+                m.role === 'discussion' && m.isStreaming
+                  ? { ...m, moderatorSummary: data.summary }
+                  : m
+              ));
+            }
+
             if (data.type === 'done') {
               setMessages(prev => prev.map(m =>
                 m.role === 'discussion' && m.isStreaming
@@ -179,5 +200,10 @@ export function usePhilosopherChat() {
     }
   }, [isLoading, sessionId]);
 
-  return { messages, isLoading, sendMessage, sessionId };
+  const exportSession = useCallback((sid: string) => {
+    const url = `${API_BASE}/api/philosophy/export/${sid}`;
+    window.open(url, '_blank');
+  }, []);
+
+  return { messages, isLoading, sendMessage, sessionId, exportSession };
 }

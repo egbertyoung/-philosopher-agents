@@ -2,9 +2,11 @@ import { PhilosophyMessage } from '../types';
 
 interface ChatMessageProps {
   message: PhilosophyMessage;
+  onReply?: (philosopherId: string, messageId: string) => void;
+  selectedPhilosopherIds?: string[];
 }
 
-export function ChatMessage({ message }: ChatMessageProps) {
+export function ChatMessage({ message, onReply, selectedPhilosopherIds }: ChatMessageProps) {
   if (message.role === 'user') {
     return (
       <div className="flex justify-end mb-4">
@@ -21,7 +23,7 @@ export function ChatMessage({ message }: ChatMessageProps) {
       {message.speeches?.map((speech, i) => (
         <div key={i} className="mb-3 ml-2">
           {/* Philosopher header */}
-          <div className="flex items-center gap-2 mb-1">
+          <div className="flex items-center gap-2 mb-1 flex-wrap">
             <span className="text-base">{speech.philosopherEmoji}</span>
             <span
               className="text-xs font-semibold px-2 py-0.5 rounded"
@@ -31,6 +33,17 @@ export function ChatMessage({ message }: ChatMessageProps) {
             </span>
             {speech.isStreaming && !speech.isDone && (
               <span className="text-xs text-gray-400">思考中...</span>
+            )}
+
+            {/* 回复按钮：仅在完成且有 onReply 回调时显示 */}
+            {!speech.isStreaming && speech.isDone && onReply && (
+              <button
+                onClick={() => onReply(speech.philosopherId, message.id)}
+                className="text-xs text-blue-500 hover:text-blue-700 ml-auto"
+                title="让其他哲学家回复这段回答"
+              >
+                ↩️ 让TA回复
+              </button>
             )}
           </div>
 
