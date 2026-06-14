@@ -3,7 +3,7 @@ import { config as dotenvConfig } from "dotenv";
 import { v4 as uuidv4 } from "uuid";
 import path from "path";
 import { fileURLToPath } from "url";
-import * as db from "./db.js";
+import * as db from "./db.ts";
 import {
   PHILOSOPHERS,
   MODERATOR_SYSTEM_PROMPT,
@@ -385,6 +385,226 @@ app.post("/api/philosophy/discuss", async (req, res) => {
   } catch (error: any) {
     console.error(`[Philosophy] Error:`, error);
     res.write(`data: ${JSON.stringify({ type: "error", message: error?.message || "哲学讨论出错" })}\n\n`);
+    res.end();
+  }
+});
+
+// ==================== 哲学家 @mention 聊天 API ====================
+
+/**
+ * 解析消息中的 @mention，返回被提及的哲学家 ID 列表
+ */
+function parseMentions(message: string): string[] {
+  const mentions: string[] = [];
+  const lowerMsg = message.toLowerCase();
+
+  for (const [id, p] of Object.entries(PHILOSOPHERS)) {
+    const patterns = [
+      `@${p.name}`,
+      `@${p.nameEn}`,
+      `@${id}`,
+      p.emoji,
+    ];
+    if (patterns.some(pat => lowerMsg.includes(pat.toLowerCase()))) {
+      if (!mentions.includes(id)) {
+        mentions.push(id);
+      }
+    }
+  }
+
+  return mentions;
+}
+
+/**
+ * 为指定哲学家构建对话历史（用于多轮对话上下文）
+ */
+function buildPhilosopherHistory(sessionId: string, philosopherId: string): Array<{ role: string; content: string }> {
+  const msgs = db.getPhilosopherMessages(sessionId, philosopherId);
+  const history: Array<{ role: string; content: string }> = [];
+
+  for (const msg of msgs) {
+    if (msg.role === 'user') {
+      // 用户消息：如果有mentions，展示提及了谁
+      let content = msg.content;
+      if (msg.mentions) {
+        try {
+          const ments = JSON.parse(msg.mentions);
+          if (ments && ments.length > 0) {
+            const names = ments.map((mid: string) => PHILOSOPHERS[mid]?.name || mid).join('、');
+            content = `[用户向 ${names} 提问] ${content}`;
+          }
+        } catch {}
+      }
+      history.push({ role: 'user', content });
+    } else if (msg.role === 'assistant' && msg.philosopher_id === philosopherId) {
+      history.push({ role: 'assistant', content: msg.content });
+    }
+  }
+
+  return history;
+}
+
+/**
+ * 哲学家 @mention 聊天模式
+ * 用户发送消息，@ 提及某些哲学家，被提及的哲学家依次回应
+ * 支持多轮对话，保留上下文
+ */
+app.post("/api/philosophy/chat", async (req, res) => {
+  const { sessionId, message, mode = "chat", mentions: reqMentions } = req.body;
+
+  console.log(`\n[Philosophy/Chat] ========== 新消息 ==========`);
+  console.log(`[Philosophy/Chat] Message: ${message?.slice(0, 80)}`);
+
+  if (!message) {
+    return res.status(400).json({ error: "请输入消息内容" });
+  }
+
+  if (!ARK_API_KEY) {
+    return res.status(500).json({ error: "未配置 ARK_API_KEY" });
+  }
+
+  // 解析 @mentions
+  const mentions = reqMentions && Array.isArray(reqMentions) && reqMentions.length > 0
+    ? reqMentions
+    : parseMentions(message);
+
+  if (mentions.length === 0) {
+    return res.status(400).json({ error: "请 @ 提及至少一位哲学家，例如：@亚里士多德 你认为什么是幸福？" });
+  }
+
+  console.log(`[Philosophy/Chat] Mentions: ${mentions.join(', ')}`);
+
+  // 获取或创建会话
+  let session = sessionId ? db.getSession(sessionId) : null;
+  const now = new Date().toISOString();
+
+  if (!session) {
+    session = db.createSession({
+      id: sessionId || uuidv4(),
+      title: message.slice(0, 30) + (message.length > 30 ? "..." : ""),
+      model: ARK_MODEL,
+      created_at: now,
+      updated_at: now,
+    });
+  }
+
+  const userMessageId = uuidv4();
+
+  // 保存用户消息（含 mentions）
+  db.createMessage({
+    id: userMessageId,
+    session_id: session.id,
+    role: "user",
+    content: message,
+    model: null,
+    created_at: now,
+    tool_calls: null,
+    philosopher_id: null,
+    mentions: JSON.stringify(mentions),
+  });
+
+  // 设置 SSE 头
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no");
+
+  // 发送初始化事件
+  res.write(`data: ${JSON.stringify({
+    type: "init",
+    sessionId: session.id,
+    userMessageId,
+    mode: "chat",
+    mentions,
+  })}\n\n`);
+
+  try {
+    // 依次让被提及的哲学家回复
+    for (const philosopherId of mentions) {
+      const philosopher = PHILOSOPHERS[philosopherId];
+      if (!philosopher) continue;
+
+      const philosopherMsgId = uuidv4();
+
+      // 通知前端该哲学家开始回复
+      res.write(`data: ${JSON.stringify({
+        type: "philosopher_start",
+        philosopherId,
+        philosopherName: philosopher.name,
+        philosopherEmoji: philosopher.emoji,
+        philosopherColor: philosopher.color,
+        messageId: philosopherMsgId,
+      })}\n\n`);
+
+      try {
+        // 构建对话历史
+        const history = buildPhilosopherHistory(session.id, philosopherId);
+
+        // 构建当前用户消息（去掉 @mention 标记，让哲学家专注内容）
+        const cleanMessage = message
+          .replace(/@(亚里士多德|孔子|黑格尔|庄子|aristotle|confucius|hegel|zhuangzi)/gi, '')
+          .replace(/🏛️|📜|⚡|🦋/g, '')
+          .trim();
+
+        const messagesForApi = [
+          ...history,
+          { role: "user", content: cleanMessage || message },
+        ];
+
+        let philosopherResponse = "";
+
+        await callArkAPI(
+          messagesForApi,
+          philosopher.systemPrompt,
+          (textChunk) => {
+            philosopherResponse += textChunk;
+            res.write(`data: ${JSON.stringify({
+              type: "philosopher_text",
+              philosopherId,
+              messageId: philosopherMsgId,
+              content: textChunk,
+            })}\n\n`);
+          }
+        );
+
+        // 哲学家回复完毕，保存消息
+        db.createMessage({
+          id: philosopherMsgId,
+          session_id: session.id,
+          role: "assistant",
+          content: philosopherResponse,
+          model: ARK_MODEL,
+          created_at: new Date().toISOString(),
+          tool_calls: null,
+          philosopher_id: philosopherId,
+          mentions: null,
+        });
+
+        res.write(`data: ${JSON.stringify({
+          type: "philosopher_done",
+          philosopherId,
+          philosopherName: philosopher.name,
+          messageId: philosopherMsgId,
+        })}\n\n`);
+
+        console.log(`[Philosophy/Chat] ${philosopher.name} 回复完毕 (${philosopherResponse.length} 字)`);
+
+      } catch (err: any) {
+        console.error(`[Philosophy/Chat] ${philosopher?.name} 回复出错:`, err);
+        res.write(`data: ${JSON.stringify({
+          type: "philosopher_error",
+          philosopherId,
+          error: err?.message || "回复出错",
+        })}\n\n`);
+      }
+    }
+
+    res.write(`data: ${JSON.stringify({ type: "done" })}\n\n`);
+    res.end();
+
+  } catch (error: any) {
+    console.error(`[Philosophy/Chat] Error:`, error);
+    res.write(`data: ${JSON.stringify({ type: "error", message: error?.message || "处理出错" })}\n\n`);
     res.end();
   }
 });

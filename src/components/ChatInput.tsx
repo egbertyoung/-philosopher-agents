@@ -1,173 +1,173 @@
-import { useRef, useCallback } from 'react';
-import { Select, Tooltip } from 'tdesign-react';
-import { ChatSender } from '@tdesign-react/chat';
-import { ChevronDownIcon, LockOnIcon, LockOffIcon, EditIcon, TaskIcon } from 'tdesign-icons-react';
-import { Model, PermissionMode } from '../types';
+import { useState, useRef, useEffect } from 'react';
+import { PHILOSOPHERS } from '../../config';
 
 interface ChatInputProps {
-  inputValue: string;
-  selectedModel: string;
-  models: Model[];
+  onSend: (text: string) => void;
   isLoading: boolean;
-  permissionMode: PermissionMode;
-  onSend: (message: string) => void;
-  onStop: () => void;
-  onChange: (value: string) => void;
-  onModelChange: (modelId: string) => void;
-  onPermissionModeChange: (mode: PermissionMode) => void;
 }
 
-// 权限模式配置
-const PERMISSION_MODE_CONFIG: Record<PermissionMode, { 
-  label: string; 
-  shortLabel: string;
-  icon: React.ReactNode; 
-  color: string;
-  description: string;
-}> = {
-  'default': { 
-    label: '默认模式', 
-    shortLabel: '默认',
-    icon: <LockOnIcon />, 
-    color: '#0052d9',
-    description: '每次操作都需要确认'
-  },
-  'acceptEdits': { 
-    label: '自动编辑', 
-    shortLabel: '自动编辑',
-    icon: <EditIcon />, 
-    color: '#2ba471',
-    description: '自动允许文件编辑操作'
-  },
-  'plan': { 
-    label: '仅规划', 
-    shortLabel: '仅规划',
-    icon: <TaskIcon />, 
-    color: '#ed7b2f',
-    description: '只生成计划，不执行操作'
-  },
-  'bypassPermissions': { 
-    label: '全部允许', 
-    shortLabel: '全部允许',
-    icon: <LockOffIcon />, 
-    color: '#e34d59',
-    description: '跳过所有权限确认（危险）'
-  },
-};
+export function ChatInput({ onSend, isLoading }: ChatInputProps) {
+  const [text, setText] = useState('');
+  const [showMentions, setShowMentions] = useState(false);
+  const [mentionFilter, setMentionFilter] = useState('');
+  const [selectedIdx, setSelectedIdx] = useState(0);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const mentionRef = useRef<HTMLDivElement>(null);
 
-export function ChatInput({
-  inputValue,
-  selectedModel,
-  models,
-  isLoading,
-  permissionMode,
-  onSend,
-  onStop,
-  onChange,
-  onModelChange,
-  onPermissionModeChange,
-}: ChatInputProps) {
-  const chatSenderRef = useRef<any>(null);
+  const filteredPhilosophers = PHILOSOPHERS.filter(p =>
+    p.name.includes(mentionFilter) ||
+    p.nameEn.toLowerCase().includes(mentionFilter.toLowerCase()) ||
+    p.id.toLowerCase().includes(mentionFilter.toLowerCase())
+  );
 
-  const handleSend = useCallback((e: any) => {
-    console.log('ChatSender send event:', e);
-    const content = e?.detail?.message || e?.detail || e?.message || inputValue;
-    if (content && typeof content === 'string' && content.trim() && selectedModel) {
-      onSend(content.trim());
-    } else if (inputValue.trim() && selectedModel) {
-      onSend(inputValue.trim());
+  const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    const value = e.target.value;
+    setText(value);
+
+    // Detect @mention
+    const cursorPos = e.target.selectionStart;
+    const textBeforeCursor = value.slice(0, cursorPos);
+    const lastAtPos = textBeforeCursor.lastIndexOf('@');
+
+    if (lastAtPos >= 0) {
+      const filterText = textBeforeCursor.slice(lastAtPos + 1);
+      // Only show if filter doesn't contain space
+      if (!filterText.includes(' ') && !filterText.includes('\n')) {
+        setMentionFilter(filterText);
+        setShowMentions(true);
+        setSelectedIdx(0);
+        return;
+      }
     }
-  }, [inputValue, selectedModel, onSend]);
+    setShowMentions(false);
+  };
 
-  const handleChange = useCallback((e: any) => {
-    console.log('ChatSender change event:', e);
-    const value = e?.detail ?? e ?? '';
-    onChange(typeof value === 'string' ? value : '');
-  }, [onChange]);
+  const insertMention = (philosopherId: string) => {
+    const philosopher = PHILOSOPHERS.find(p => p.id === philosopherId);
+    if (!philosopher) return;
 
-  const currentModeConfig = PERMISSION_MODE_CONFIG[permissionMode];
+    const cursorPos = textareaRef.current?.selectionStart || 0;
+    const textBeforeCursor = text.slice(0, cursorPos);
+    const lastAtPos = textBeforeCursor.lastIndexOf('@');
+
+    if (lastAtPos >= 0) {
+      const newValue = text.slice(0, lastAtPos) + `@${philosopher.name} ` + text.slice(cursorPos);
+      setText(newValue);
+      setShowMentions(false);
+      // Focus back to textarea
+      setTimeout(() => {
+        textareaRef.current?.focus();
+        const newPos = lastAtPos + `@${philosopher.name} `.length;
+        textareaRef.current?.setSelectionRange(newPos, newPos);
+      }, 0);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (showMentions) {
+      if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        setSelectedIdx(prev => (prev + 1) % filteredPhilosophers.length);
+        return;
+      }
+      if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        setSelectedIdx(prev => (prev - 1 + filteredPhilosophers.length) % filteredPhilosophers.length);
+        return;
+      }
+      if (e.key === 'Enter' && !e.shiftKey) {
+        e.preventDefault();
+        if (filteredPhilosophers.length > 0) {
+          insertMention(filteredPhilosophers[selectedIdx].id);
+        }
+        return;
+      }
+      if (e.key === 'Escape') {
+        setShowMentions(false);
+        return;
+      }
+    }
+
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  };
+
+  const handleSend = () => {
+    if (!text.trim() || isLoading) return;
+    onSend(text.trim());
+    setText('');
+    setShowMentions(false);
+  };
+
+  // Close mention dropdown on click outside
+  useEffect(() => {
+    const handler = (e: MouseEvent) => {
+      if (mentionRef.current && !mentionRef.current.contains(e.target as Node)) {
+        setShowMentions(false);
+      }
+    };
+    document.addEventListener('mousedown', handler);
+    return () => document.removeEventListener('mousedown', handler);
+  }, []);
 
   return (
-    <div 
-      className="px-4 pb-6 pt-4"
-      style={{ 
-        backgroundColor: 'var(--td-bg-color-page)'
-      }}
-    >
-      <div className="max-w-3xl mx-auto">
-        <ChatSender
-          ref={chatSenderRef}
-          value={inputValue}
-          placeholder="输入消息..."
-          disabled={!selectedModel}
-          loading={isLoading}
-          autosize={{ minRows: 1, maxRows: 6 }}
-          actions={['send']}
-          onSend={handleSend}
-          onStop={onStop}
-          onChange={handleChange}
+    <div className="relative border-t border-gray-200 bg-white px-4 py-3">
+      {/* Mention dropdown */}
+      {showMentions && filteredPhilosophers.length > 0 && (
+        <div
+          ref={mentionRef}
+          className="absolute bottom-full left-4 right-4 mb-1 bg-white border border-gray-200 rounded-lg shadow-lg max-h-48 overflow-y-auto z-50"
         >
-          {/* 模型选择器和权限模式选择器放在 footer-prefix 插槽 */}
-          <div slot="footer-prefix" className="flex items-center gap-2">
-            {/* 模型选择器 */}
-            <Select
-              value={selectedModel}
-              onChange={(value) => onModelChange(value as string)}
-              placeholder="选择模型"
-              size="small"
-              style={{ width: 160 }}
-              filterable
-              borderless
-              suffixIcon={<ChevronDownIcon />}
+          {filteredPhilosophers.map((p, i) => (
+            <div
+              key={p.id}
+              className={`px-4 py-2 cursor-pointer flex items-center gap-2 ${
+                i === selectedIdx ? 'bg-blue-50' : 'hover:bg-gray-50'
+              }`}
+              onClick={() => insertMention(p.id)}
+              onMouseEnter={() => setSelectedIdx(i)}
             >
-              {models.map(model => (
-                <Select.Option key={model.modelId} value={model.modelId} label={model.name} />
-              ))}
-            </Select>
-            
-            {/* 分隔线 */}
-            <div 
-              className="h-4 w-px"
-              style={{ backgroundColor: 'var(--td-component-stroke)' }}
-            />
-            
-            {/* 权限模式选择器 */}
-            <Tooltip content={currentModeConfig.description} placement="top">
-              <Select
-                value={permissionMode}
-                onChange={(value) => onPermissionModeChange(value as PermissionMode)}
-                size="small"
-                style={{ width: 110 }}
-                borderless
-                suffixIcon={<ChevronDownIcon />}
-                prefixIcon={
-                  <span style={{ color: currentModeConfig.color }}>
-                    {currentModeConfig.icon}
-                  </span>
-                }
-                popupProps={{
-                  overlayInnerStyle: { width: 140 }
-                }}
-              >
-                {(Object.keys(PERMISSION_MODE_CONFIG) as PermissionMode[]).map(mode => {
-                  const config = PERMISSION_MODE_CONFIG[mode];
-                  return (
-                    <Select.Option 
-                      key={mode} 
-                      value={mode} 
-                      label={config.shortLabel}
-                    >
-                      <div className="flex items-center gap-2">
-                        <span style={{ color: config.color }}>{config.icon}</span>
-                        <span>{config.shortLabel}</span>
-                      </div>
-                    </Select.Option>
-                  );
-                })}
-              </Select>
-            </Tooltip>
-          </div>
-        </ChatSender>
+              <span className="text-lg">{p.emoji}</span>
+              <div>
+                <div className="font-medium text-sm">{p.name}</div>
+                <div className="text-xs text-gray-500">{p.nameEn}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Input area */}
+      <div className="flex items-end gap-2">
+        <div className="flex-1 relative">
+          <textarea
+            ref={textareaRef}
+            value={text}
+            onChange={handleInput}
+            onKeyDown={handleKeyDown}
+            placeholder="输入消息，用 @ 提及哲学家，例如：@亚里士多德 你认为什么是幸福？"
+            disabled={isLoading}
+            rows={1}
+            className="w-full px-4 py-3 border border-gray-300 rounded-xl resize-none focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-sm max-h-32"
+            style={{ minHeight: '44px' }}
+          />
+        </div>
+        <button
+          onClick={handleSend}
+          disabled={!text.trim() || isLoading}
+          className="px-5 py-3 bg-blue-600 text-white rounded-xl hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium text-sm flex items-center gap-1"
+        >
+          {isLoading ? (
+            <span className="inline-block w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
+          ) : (
+            <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 19l9 2-9-18-9 18 9-2zm0 0v-8" />
+            </svg>
+          )}
+          <span>{isLoading ? '发送中' : '发送'}</span>
+        </button>
       </div>
     </div>
   );

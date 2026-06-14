@@ -1,11 +1,11 @@
 import { BrowserRouter, Routes, Route } from 'react-router-dom';
-import { PhilosophyPage } from './pages/PhilosophyPage';
+import { ChatPage } from './pages/ChatPage';
 
 function App() {
   return (
     <BrowserRouter>
       <Routes>
-        <Route path="/*" element={<PhilosophyPage />} />
+        <Route path="/*" element={<ChatPage />} />
       </Routes>
     </BrowserRouter>
   );
