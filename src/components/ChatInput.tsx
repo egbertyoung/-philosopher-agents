@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect } from 'react';
-import { PHILOSOPHERS } from '../../config';
+import { PHILOSOPHERS } from '../config';
+// ChatInput: @mention autocomplete input component
 
 interface ChatInputProps {
   onSend: (text: string) => void;

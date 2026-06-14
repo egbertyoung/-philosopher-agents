@@ -1,4 +1,4 @@
-import { PhilosophyMessage } from '../../types';
+import { PhilosophyMessage } from '../types';
 
 interface ChatMessageProps {
   message: PhilosophyMessage;
